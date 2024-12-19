@@ -72,19 +72,22 @@ async function run() {
           console.warn(`🤔 ${config.input_files} not include valid file.`);
         }
       }
-      const currentAssets = rel.assets;
-
-      const uploadFile = async (path) => {
-        const json = await upload(
+      
+      try {
+        const assets = await uploadFiles(
           config,
           gh,
+          rel.id,
           uploadUrl(rel.upload_url),
-          path,
-          currentAssets,
+          files,
+          rel.assets
         );
-        delete json.uploader;
-        return json;
-      };
+        setOutput("assets", assets);
+      } catch (error) {
+        console.error('Upload failed:', error);
+        throw error;
+      }
+    }
 
       let assets;
       if (!config.input_preserve_order) {
