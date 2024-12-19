@@ -153,53 +153,140 @@ export const mimeOrDefault = (path: string): string => {
   return getType(path) || "application/octet-stream";
 };
 
-export const upload = async (
+export class UploadQueue {
+  private uploadInProgress: boolean = false;
+  private queue: Array<() => Promise<void>> = [];
+
+  async add(task: () => Promise<void>): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          await task();
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+      this.processQueue();
+    });
+  }
+
+  private async processQueue() {
+    if (this.uploadInProgress || this.queue.length === 0) return;
+    
+    this.uploadInProgress = true;
+    try {
+      const task = this.queue.shift();
+      if (task) {
+        await task();
+      }
+    } finally {
+      this.uploadInProgress = false;
+      this.processQueue();
+    }
+  }
+}
+
+export const uploadWithRetry = async (
   config: Config,
   github: GitHub,
   url: string,
   path: string,
   currentAssets: Array<{ id: number; name: string }>,
+  maxRetries: number = 3,
+  initialDelay: number = 1000
 ): Promise<any> => {
-  const [owner, repo] = config.github_repository.split("/");
-  const { name, size, mime, data: body } = asset(path);
-  const currentAsset = currentAssets.find(
-    // note: GitHub renames asset filenames that have special characters, non-alphanumeric characters, and leading or trailing periods. The "List release assets" endpoint lists the renamed filenames.
-    // due to this renaming we need to be mindful when we compare the file name we're uploading with a name github may already have rewritten for logical comparison
-    // see https://docs.github.com/en/rest/releases/assets?apiVersion=2022-11-28#upload-a-release-asset
-    ({ name: currentName }) => currentName == alignAssetName(name),
-  );
-  if (currentAsset) {
-    console.log(`♻️ Deleting previously uploaded asset ${name}...`);
-    await github.rest.repos.deleteReleaseAsset({
-      asset_id: currentAsset.id || 1,
-      owner,
-      repo,
-    });
+  let lastError;
+  let delay = initialDelay;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // First, ensure any deletion is complete
+      const [owner, repo] = config.github_repository.split("/");
+      const { name } = asset(path);
+      const currentAsset = currentAssets.find(
+        ({ name: currentName }) => currentName === alignAssetName(name)
+      );
+
+      if (currentAsset) {
+        console.log(`♻️ Deleting previously uploaded asset ${name}... (attempt ${attempt})`);
+        try {
+          await github.rest.repos.deleteReleaseAsset({
+            asset_id: currentAsset.id,
+            owner,
+            repo,
+          });
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (deleteError) {
+          if (deleteError.status === 404) {
+            console.log(`Asset ${name} already deleted or not found`);
+          } else {
+            throw deleteError;
+          }
+        }
+      }
+
+      console.log(`⬆️ Uploading ${name}... (attempt ${attempt})`);
+      return await upload(config, github, url, path, []); 
+
+    } catch (error) {
+      lastError = error;
+      
+      if (error.code === 'EPIPE' || error.code === 'ECONNRESET' || error.status === 500) {
+        if (attempt < maxRetries) {
+          console.log(`⚠️ Upload failed (attempt ${attempt}/${maxRetries}). Error: ${error.message}`);
+          console.log(`Retrying in ${delay/1000} seconds...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay *= 2;
+          continue;
+        }
+      } else {
+        throw error;
+      }
+    }
   }
-  console.log(`⬆️ Uploading ${name}...`);
-  const endpoint = new URL(url);
-  endpoint.searchParams.append("name", name);
-  const resp = await github.request({
-    method: "POST",
-    url: endpoint.toString(),
-    headers: {
-      "content-length": `${size}`,
-      "content-type": mime,
-      authorization: `token ${config.github_token}`,
-    },
-    data: body,
-  });
-  const json = resp.data;
-  if (resp.status !== 201) {
-    throw new Error(
-      `Failed to upload release asset ${name}. received status code ${
-        resp.status
-      }\n${json.message}\n${JSON.stringify(json.errors)}`,
-    );
-  }
-  return json;
+  
+  throw lastError;
 };
 
+export const uploadFiles = async (
+  config: Config,
+  gh: GitHub,
+  releaseId: number,
+  uploadUrl: string,
+  files: string[],
+  currentAssets: Array<{ id: number; name: string }>
+): Promise<any[]> => {
+  const uploadQueue = new UploadQueue();
+  const assets = [];
+
+  for (const path of files) {
+    try {
+      const asset = await new Promise((resolve, reject) => {
+        uploadQueue.add(async () => {
+          try {
+            const result = await uploadWithRetry(
+              config,
+              gh,
+              uploadUrl,
+              path,
+              currentAssets
+            );
+            resolve(result);
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+      assets.push(asset);
+    } catch (error) {
+      console.error(`Failed to upload ${path}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  return assets;
+};
 export const release = async (
   config: Config,
   releaser: Releaser,
